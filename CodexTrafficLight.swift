@@ -24,6 +24,14 @@ enum LightState: Int, Comparable {
         }
     }
 
+    var nsColor: NSColor {
+        switch self {
+        case .red: .systemRed
+        case .yellow: .systemYellow
+        case .green: .systemGreen
+        }
+    }
+
     var label: String {
         switch self {
         case .red: "需要操作"
@@ -303,9 +311,13 @@ final class TaskMonitor: ObservableObject {
         timer?.invalidate()
     }
 
-    var aggregate: LightState {
-        if errorMessage != nil { return .red }
-        return tasks.map(\.state).max() ?? .green
+    var aggregate: LightState? {
+        Self.aggregate(for: tasks, errorMessage: errorMessage)
+    }
+
+    static func aggregate(for tasks: [CodexTask], errorMessage: String?) -> LightState? {
+        guard errorMessage == nil else { return nil }
+        return tasks.map(\.state).max()
     }
 
     func refresh() {
@@ -318,72 +330,65 @@ final class TaskMonitor: ObservableObject {
                 self.isLoading = false
                 switch result {
                 case .success(let snapshot):
-                    self.tasks = snapshot.tasks
-                    self.errorMessage = nil
+                    if self.tasks != snapshot.tasks { self.tasks = snapshot.tasks }
+                    if self.errorMessage != nil { self.errorMessage = nil }
                 case .failure(let error):
-                    self.errorMessage = error.localizedDescription
+                    let message = error.localizedDescription
+                    if self.errorMessage != message { self.errorMessage = message }
                 }
             }
         }
+    }
+}
+
+final class AppSettings: ObservableObject {
+    private enum Key {
+        static let showDesktopAtLaunch = "showDesktopAtLaunch"
+        static let alwaysOnTop = "alwaysOnTop"
+        static let showCompleted = "showCompleted"
+    }
+
+    @Published var showDesktopAtLaunch: Bool {
+        didSet { defaults.set(showDesktopAtLaunch, forKey: Key.showDesktopAtLaunch) }
+    }
+    @Published var alwaysOnTop: Bool {
+        didSet { defaults.set(alwaysOnTop, forKey: Key.alwaysOnTop) }
+    }
+    @Published var showCompleted: Bool {
+        didSet { defaults.set(showCompleted, forKey: Key.showCompleted) }
+    }
+
+    private let defaults: UserDefaults
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        showDesktopAtLaunch = defaults.object(forKey: Key.showDesktopAtLaunch) as? Bool ?? true
+        alwaysOnTop = defaults.object(forKey: Key.alwaysOnTop) as? Bool ?? true
+        showCompleted = defaults.object(forKey: Key.showCompleted) as? Bool ?? true
     }
 }
 
 struct TrafficLightIcon: View {
-    let state: LightState
+    let state: LightState?
 
     var body: some View {
-        HStack(spacing: 2.5) {
-            dot(.red)
-            dot(.yellow)
-            dot(.green)
-        }
-        .padding(.horizontal, 4.5)
-        .padding(.vertical, 3.5)
-        .background(Color.primary.opacity(0.09), in: Capsule())
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Codex，\(state.label)")
-    }
-
-    private func dot(_ dotState: LightState) -> some View {
         Circle()
-            .fill(dotState.color.opacity(dotState == state ? 1 : 0.18))
-            .frame(width: 7, height: 7)
+            .fill(state?.color ?? Color.secondary.opacity(0.55))
+            .frame(width: 11, height: 11)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Codex，\(state?.label ?? "暂无状态")")
     }
 }
 
-struct MenuBarTrafficLightIcon: View {
-    let state: LightState
-
-    var body: some View {
-        Image(nsImage: Self.image(for: state))
-            .renderingMode(.original)
-            .frame(width: 18, height: 12)
-            .accessibilityLabel("Codex，\(state.label)")
-    }
-
-    static func image(for state: LightState) -> NSImage {
-        let size = NSSize(width: 18, height: 12)
+enum MenuBarDot {
+    static func image(for state: LightState?) -> NSImage {
+        let size = NSSize(width: 18, height: 14)
         let image = NSImage(size: size, flipped: false) { _ in
-            let states: [LightState] = [.red, .yellow, .green]
-            let diameter: CGFloat = 4.5
-            let gap: CGFloat = 1.5
-            let startX = (size.width - diameter * 3 - gap * 2) / 2
+            let diameter: CGFloat = 9
+            let x = (size.width - diameter) / 2
             let y = (size.height - diameter) / 2
-
-            for (index, dotState) in states.enumerated() {
-                let color: NSColor = switch dotState {
-                case .red: .systemRed
-                case .yellow: .systemYellow
-                case .green: .systemGreen
-                }
-                color.withAlphaComponent(dotState == state ? 1 : 0.32).setFill()
-                NSBezierPath(ovalIn: NSRect(
-                    x: startX + CGFloat(index) * (diameter + gap),
-                    y: y,
-                    width: diameter,
-                    height: diameter
-                )).fill()
-            }
+            (state?.nsColor ?? .systemGray).setFill()
+            NSBezierPath(ovalIn: NSRect(x: x, y: y, width: diameter, height: diameter)).fill()
             return true
         }
         image.isTemplate = false
@@ -417,12 +422,19 @@ struct TaskRow: View {
 
 struct Dashboard: View {
     @ObservedObject var monitor: TaskMonitor
+    @ObservedObject var settings: AppSettings
+    let isDesktop: Bool
+    let showDesktop: () -> Void
+    let showSettings: () -> Void
+
+    private var visibleTasks: [CodexTask] {
+        settings.showCompleted ? monitor.tasks : monitor.tasks.filter { $0.state != .green }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 11) {
             HStack(spacing: 9) {
                 TrafficLightIcon(state: monitor.aggregate)
-                    .scaleEffect(1.2)
                 VStack(alignment: .leading, spacing: 1) {
                     Text("Codex 状态")
                         .font(.system(size: 14, weight: .semibold))
@@ -439,14 +451,14 @@ struct Dashboard: View {
                     .font(.system(size: 11))
                     .foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
-            } else if monitor.tasks.isEmpty {
-                Text("还没有可显示的 Codex 任务")
+            } else if visibleTasks.isEmpty {
+                Text(monitor.tasks.isEmpty ? "还没有可显示的 Codex 任务" : "没有正在运行或需要操作的任务")
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, minHeight: 48)
             } else {
                 VStack(spacing: 5) {
-                    ForEach(monitor.tasks) { task in
+                    ForEach(visibleTasks) { task in
                         TaskRow(task: task)
                     }
                 }
@@ -464,11 +476,41 @@ struct Dashboard: View {
 
                 Spacer()
 
-                Button("退出") {
-                    NSApplication.shared.terminate(nil)
+                Group {
+                    if isDesktop {
+                        Button {
+                            settings.alwaysOnTop.toggle()
+                        } label: {
+                            Label(settings.alwaysOnTop ? "取消置顶" : "置顶", systemImage: settings.alwaysOnTop ? "pin.slash" : "pin")
+                        }
+                        .help(settings.alwaysOnTop ? "让窗口恢复普通层级" : "让窗口固定在其他窗口前面")
+                    } else {
+                        Button {
+                            showDesktop()
+                        } label: {
+                            Label("桌面窗口", systemImage: "macwindow")
+                        }
+                    }
                 }
                 .buttonStyle(.borderless)
                 .controlSize(.small)
+
+                Button {
+                    showSettings()
+                } label: {
+                    Image(systemName: "gearshape")
+                }
+                .buttonStyle(.borderless)
+                .controlSize(.small)
+                .help("设置")
+
+                if !isDesktop {
+                    Button("退出") {
+                        NSApplication.shared.terminate(nil)
+                    }
+                    .buttonStyle(.borderless)
+                    .controlSize(.small)
+                }
             }
         }
         .padding(14)
@@ -494,64 +536,265 @@ struct Dashboard: View {
     }
 }
 
-@main
-struct CodexTrafficLightApp: App {
-    @StateObject private var monitor: TaskMonitor
+struct SettingsView: View {
+    @ObservedObject var settings: AppSettings
 
-    init() {
-        if CommandLine.arguments.contains("--self-test") {
-            Self.runSelfTest()
-            exit(EXIT_SUCCESS)
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Codex Traffic Light 设置")
+                .font(.system(size: 16, weight: .semibold))
+            Toggle("启动应用时显示桌面窗口", isOn: $settings.showDesktopAtLaunch)
+            Toggle("桌面窗口始终置顶", isOn: $settings.alwaysOnTop)
+            Toggle("显示已完成任务", isOn: $settings.showCompleted)
+            Text("关闭桌面窗口只会把它隐藏；菜单栏圆点仍会继续更新。")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
-        if CommandLine.arguments.contains("--check-live") {
-            do {
-                let tasks = try StatusReader.load().tasks
-                let counts = Dictionary(grouping: tasks, by: \.state).mapValues(\.count)
-                print("Live snapshot passed: \(tasks.count) tasks, red=\(counts[.red, default: 0]), yellow=\(counts[.yellow, default: 0]), green=\(counts[.green, default: 0])")
-                exit(EXIT_SUCCESS)
-            } catch {
-                fputs("Live snapshot failed: \(error.localizedDescription)\n", stderr)
-                exit(EXIT_FAILURE)
+        .toggleStyle(.switch)
+        .padding(18)
+        .frame(width: 340)
+    }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private let monitor = TaskMonitor()
+    private let settings = AppSettings()
+    private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+    private let popover = NSPopover()
+    private var panel: NSPanel?
+    private var settingsWindow: NSWindow?
+    private var popoverHost: NSHostingController<Dashboard>?
+    private var panelHost: NSHostingController<Dashboard>?
+    private var cancellables = Set<AnyCancellable>()
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        configureStatusItem()
+        configurePopover()
+        configurePanel()
+        configureSettingsWindow()
+
+        monitor.$tasks.combineLatest(monitor.$errorMessage)
+            .sink { [weak self] _, _ in
+                self?.updateStatusItem()
+                self?.resizeDashboards()
             }
+            .store(in: &cancellables)
+        settings.$showCompleted
+            .sink { [weak self] _ in self?.resizeDashboards() }
+            .store(in: &cancellables)
+        settings.$alwaysOnTop
+            .sink { [weak self] _ in self?.applyPanelLevel() }
+            .store(in: &cancellables)
+
+        updateStatusItem()
+        if settings.showDesktopAtLaunch {
+            DispatchQueue.main.async { [weak self] in self?.showDesktop(activate: false) }
         }
-        _monitor = StateObject(wrappedValue: TaskMonitor())
     }
 
-    var body: some Scene {
-        MenuBarExtra {
-            Dashboard(monitor: monitor)
-        } label: {
-            MenuBarTrafficLightIcon(state: monitor.aggregate)
-        }
-        .menuBarExtraStyle(.window)
+    private func configureStatusItem() {
+        guard let button = statusItem.button else { return }
+        button.imagePosition = .imageOnly
+        button.target = self
+        button.action = #selector(togglePopover)
     }
 
-    private static func runSelfTest() {
-        let prompt = Data("""
+    private func configurePopover() {
+        let root = Dashboard(
+            monitor: monitor,
+            settings: settings,
+            isDesktop: false,
+            showDesktop: { [weak self] in
+                self?.popover.performClose(nil)
+                self?.showDesktop(activate: true)
+            },
+            showSettings: { [weak self] in self?.showSettings() }
+        )
+        let host = NSHostingController(rootView: root)
+        popoverHost = host
+        popover.behavior = .transient
+        popover.contentViewController = host
+    }
+
+    private func configurePanel() {
+        let root = Dashboard(
+            monitor: monitor,
+            settings: settings,
+            isDesktop: true,
+            showDesktop: {},
+            showSettings: { [weak self] in self?.showSettings() }
+        )
+        let host = NSHostingController(rootView: root)
+        panelHost = host
+
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 320, height: 220),
+            styleMask: [.titled, .closable, .utilityWindow],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = "Codex 状态"
+        panel.contentViewController = host
+        panel.isReleasedWhenClosed = false
+        panel.hidesOnDeactivate = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.standardWindowButton(.miniaturizeButton)?.isHidden = true
+        panel.standardWindowButton(.zoomButton)?.isHidden = true
+
+        let frameName = "CodexTrafficLightDesktopWindow"
+        if !panel.setFrameUsingName(frameName), let screen = NSScreen.main {
+            let visible = screen.visibleFrame
+            panel.setFrameOrigin(NSPoint(x: visible.maxX - panel.frame.width - 18, y: visible.maxY - panel.frame.height - 18))
+        }
+        panel.setFrameAutosaveName(frameName)
+        self.panel = panel
+        applyPanelLevel()
+    }
+
+    private func configureSettingsWindow() {
+        let host = NSHostingController(rootView: SettingsView(settings: settings))
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 340, height: 220),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Codex Traffic Light 设置"
+        window.contentViewController = host
+        window.isReleasedWhenClosed = false
+        window.standardWindowButton(.miniaturizeButton)?.isHidden = true
+        window.standardWindowButton(.zoomButton)?.isHidden = true
+        window.center()
+        settingsWindow = window
+    }
+
+    private func updateStatusItem() {
+        guard let button = statusItem.button else { return }
+        button.image = MenuBarDot.image(for: monitor.aggregate)
+        let detail = monitor.errorMessage == nil ? (monitor.aggregate?.label ?? "没有任务") : "状态读取失败"
+        button.setAccessibilityLabel("Codex，\(detail)")
+        button.toolTip = "Codex：\(detail)"
+    }
+
+    private func resizeDashboards() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if let host = self.popoverHost {
+                host.view.layoutSubtreeIfNeeded()
+                self.popover.contentSize = host.view.fittingSize
+            }
+            guard let panel = self.panel, let host = self.panelHost else { return }
+            host.view.layoutSubtreeIfNeeded()
+            let oldTop = panel.frame.maxY
+            panel.setContentSize(host.view.fittingSize)
+            panel.setFrameOrigin(NSPoint(x: panel.frame.minX, y: oldTop - panel.frame.height))
+        }
+    }
+
+    private func applyPanelLevel() {
+        panel?.isFloatingPanel = settings.alwaysOnTop
+        panel?.level = settings.alwaysOnTop ? .floating : .normal
+    }
+
+    @objc private func togglePopover() {
+        if popover.isShown {
+            popover.performClose(nil)
+            return
+        }
+        guard let button = statusItem.button else { return }
+        resizeDashboards()
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+    }
+
+    private func showDesktop(activate: Bool) {
+        guard let panel else { return }
+        resizeDashboards()
+        if activate {
+            NSApp.activate(ignoringOtherApps: true)
+            panel.makeKeyAndOrderFront(nil)
+        } else {
+            panel.orderFrontRegardless()
+        }
+    }
+
+    private func showSettings() {
+        popover.performClose(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        settingsWindow?.makeKeyAndOrderFront(nil)
+    }
+}
+
+private func runSelfTest() {
+    let prompt = Data("""
         {"type":"response_item","payload":{"type":"function_call","name":"request_user_input","call_id":"q1"}}
         """.utf8)
-        let answered = Data("""
+    let answered = Data("""
         {"type":"response_item","payload":{"type":"function_call","name":"request_user_input","call_id":"q1"}}
         {"type":"response_item","payload":{"type":"function_call_output","call_id":"q1"}}
         """.utf8)
 
-        let running = Data("""
+    let running = Data("""
         {"type":"event_msg","payload":{"type":"task_started"}}
         """.utf8)
-        let completed = Data("""
+    let completed = Data("""
         {"type":"event_msg","payload":{"type":"task_started"}}
         {"type":"event_msg","payload":{"type":"task_complete"}}
         """.utf8)
 
-        precondition(StatusReader.signals(in: prompt).pendingQuestion)
-        precondition(!StatusReader.signals(in: answered).pendingQuestion)
-        precondition(StatusReader.classify(lockHeld: true, signals: StatusReader.signals(in: running)) == .yellow)
-        precondition(StatusReader.classify(lockHeld: true, signals: StatusReader.signals(in: prompt)) == .red)
-        precondition(StatusReader.classify(lockHeld: true, signals: StatusReader.signals(in: completed)) == .green)
-        precondition(StatusReader.classify(lockHeld: false, signals: StatusReader.signals(in: running)) == .green)
-        let menuImage = MenuBarTrafficLightIcon.image(for: .yellow)
-        precondition(menuImage.size == NSSize(width: 18, height: 12))
-        precondition((menuImage.tiffRepresentation?.count ?? 0) > 100)
-        print("Codex Traffic Light self-test passed")
+    precondition(StatusReader.signals(in: prompt).pendingQuestion)
+    precondition(!StatusReader.signals(in: answered).pendingQuestion)
+    precondition(StatusReader.classify(lockHeld: true, signals: StatusReader.signals(in: running)) == .yellow)
+    precondition(StatusReader.classify(lockHeld: true, signals: StatusReader.signals(in: prompt)) == .red)
+    precondition(StatusReader.classify(lockHeld: true, signals: StatusReader.signals(in: completed)) == .green)
+    precondition(StatusReader.classify(lockHeld: false, signals: StatusReader.signals(in: running)) == .green)
+
+    let now = Date()
+    let green = CodexTask(id: "g", title: "green", state: .green, updatedAt: now)
+    let yellow = CodexTask(id: "y", title: "yellow", state: .yellow, updatedAt: now)
+    let red = CodexTask(id: "r", title: "red", state: .red, updatedAt: now)
+    precondition(TaskMonitor.aggregate(for: [green, yellow, red], errorMessage: nil) == .red)
+    precondition(TaskMonitor.aggregate(for: [], errorMessage: nil) == nil)
+    precondition(TaskMonitor.aggregate(for: [red], errorMessage: "failed") == nil)
+
+    let menuImage = MenuBarDot.image(for: .yellow)
+    precondition(menuImage.size == NSSize(width: 18, height: 14))
+    precondition((menuImage.tiffRepresentation?.count ?? 0) > 100)
+
+    let suiteName = "com.newton.codex-traffic-light.self-test.\(UUID().uuidString)"
+    guard let defaults = UserDefaults(suiteName: suiteName) else { preconditionFailure("无法创建测试设置") }
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let initial = AppSettings(defaults: defaults)
+    precondition(initial.showDesktopAtLaunch && initial.alwaysOnTop && initial.showCompleted)
+    initial.alwaysOnTop = false
+    initial.showCompleted = false
+    let restored = AppSettings(defaults: defaults)
+    precondition(!restored.alwaysOnTop && !restored.showCompleted)
+    print("Codex Traffic Light self-test passed")
+}
+
+private func printLiveSnapshot() -> Never {
+    do {
+        let tasks = try StatusReader.load().tasks
+        let counts = Dictionary(grouping: tasks, by: \.state).mapValues(\.count)
+        print("Live snapshot passed: \(tasks.count) tasks, red=\(counts[.red, default: 0]), yellow=\(counts[.yellow, default: 0]), green=\(counts[.green, default: 0])")
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Live snapshot failed: \(error.localizedDescription)\n", stderr)
+        exit(EXIT_FAILURE)
     }
 }
+
+if CommandLine.arguments.contains("--self-test") {
+    runSelfTest()
+    exit(EXIT_SUCCESS)
+}
+if CommandLine.arguments.contains("--check-live") {
+    printLiveSnapshot()
+}
+
+let application = NSApplication.shared
+let appDelegate = AppDelegate()
+application.delegate = appDelegate
+application.setActivationPolicy(.accessory)
+application.run()

@@ -10,7 +10,7 @@ binary="$contents/MacOS/CodexTrafficLight"
 rm -rf "$app"
 mkdir -p "$contents/MacOS"
 
-swiftc -O -parse-as-library \
+swiftc -O \
   -target "$(uname -m)-apple-macosx13.0" \
   "$project_dir/CodexTrafficLight.swift" \
   -o "$binary" \
@@ -26,8 +26,8 @@ plutil -insert CFBundleIdentifier -string com.newton.codex-traffic-light "$conte
 plutil -insert CFBundleInfoDictionaryVersion -string 6.0 "$contents/Info.plist"
 plutil -insert CFBundleName -string "Codex Traffic Light" "$contents/Info.plist"
 plutil -insert CFBundlePackageType -string APPL "$contents/Info.plist"
-plutil -insert CFBundleShortVersionString -string 1.0.0 "$contents/Info.plist"
-plutil -insert CFBundleVersion -string 1 "$contents/Info.plist"
+plutil -insert CFBundleShortVersionString -string 1.1.0 "$contents/Info.plist"
+plutil -insert CFBundleVersion -string 2 "$contents/Info.plist"
 plutil -insert LSMinimumSystemVersion -string 13.0 "$contents/Info.plist"
 plutil -insert LSUIElement -bool true "$contents/Info.plist"
 plutil -insert NSHighResolutionCapable -bool true "$contents/Info.plist"
