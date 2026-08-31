@@ -1,33 +1,36 @@
 # Codex Traffic Light
 
-一个很小的原生 macOS 菜单栏指示器，同时汇总 Codex 桌面版与 VS Code Codex 任务。
+Codex Traffic Light is a small native macOS menu bar app that shows the combined status of Codex Desktop and Codex tasks in VS Code.
 
-- 红灯：Codex 正在等你选择。
-- 黄灯：任务正在运行。
-- 绿灯：任务已经结束。
-- 灰灯：没有任务，或暂时无法读取状态。
+- Red: Codex is waiting for your input.
+- Yellow: A task is running.
+- Green: A task has finished.
+- Gray: No task is available, or the app cannot read the current status.
 
-菜单栏只显示一个当前状态圆点。点它会展开最多 8 条任务；需要操作和运行中的任务排在前面。每条任务显示标题和自己的状态，点击任务会回到它所在的 Codex 桌面端或 VS Code 窗口，并尽量直接打开该对话。
+The menu bar shows one dot for the current combined status. Click it to view up to eight recent tasks, with tasks that need input or are still running listed first. Each row shows the task title and status. Clicking a task returns to its Codex Desktop or VS Code window and attempts to open the exact conversation.
 
-应用启动时还会显示同样内容的桌面小窗口。它可以关闭、从菜单栏重新打开，也可以固定在其他窗口前面。设置里可以选择是否启动时显示、是否始终置顶，以及是否显示已完成任务。窗口位置会自动记住。
+The app can also display the same task list in a small desktop window. You can close and reopen this window from the menu bar or keep it above other windows. Settings control whether the desktop window opens at launch, stays on top, and includes completed tasks. The app remembers the window position.
 
-## 构建与运行
+## Build and Run
 
-需要 macOS 13 或更高版本，以及 Apple Command Line Tools。
+Requirements:
+
+- macOS 13 or later
+- Apple Command Line Tools
 
 ```sh
 ./build.sh
 open "build/Codex Traffic Light.app"
 ```
 
-应用不显示在 Dock。关闭桌面窗口不会退出；退出请点菜单栏下拉面板底部的“退出”。
+The app does not appear in the Dock. Closing the desktop window does not quit the app. Use the quit control at the bottom of the menu bar panel to exit.
 
-第一次跳转到 VS Code 对话时，VS Code 可能会询问是否允许 Codex 扩展打开链接。若希望以后单击直达，可勾选“不再询问此扩展”后点“打开”；即使扩展路由不可用，应用仍会打开该任务对应的 VS Code 工作区。
+The first time you open a VS Code conversation, VS Code may ask whether the Codex extension can open the link. Allow the link and select the option to remember your choice if you want future task clicks to open directly. If the extension route is unavailable, the app still opens the VS Code workspace associated with the task.
 
-## 数据与兼容性
+## Data and Compatibility
 
-应用每 2 秒只读检查 `~/.codex` 中的任务索引、任务生命周期和 writer lock。标题只取 Codex 生成的任务名；它仅从当前运行 turn 的本地记录中识别 `request_user_input` 是否仍未回答，并在点击时读取会话来源和工作目录来完成跳转，不会显示、保存或上传对话正文。
+Every two seconds, the app reads the task index, task lifecycle, and writer locks under `~/.codex`. Access is read-only. Task titles come from Codex-generated names. The app checks the local record for the current turn only to determine whether a `request_user_input` call is still unanswered. When you click a task, it reads the session source and working directory to choose the correct destination. It does not display, store, or upload conversation content.
 
-Codex 桌面版和 VS Code 目前各自使用私有的 stdio App Server，外部应用无法直接订阅两边的实时状态，因此这一版使用共享的本地只读状态。若 Codex 以后更改本地数据库或 rollout 格式，需要同步更新读取逻辑。官方状态模型见 [Codex App Server 文档](https://developers.openai.com/codex/app-server)。
+Codex Desktop and VS Code currently use separate private stdio App Server connections. External apps cannot subscribe directly to both live status streams, so this version uses their shared local state. The reader may need an update if Codex changes its local database or rollout format. See the official [Codex App Server documentation](https://developers.openai.com/codex/app-server).
 
-已知边界：未写入本地记录的审批等待可能暂时显示为黄灯；精确覆盖这种状态需要两个客户端提供可共享的官方状态流。
+Known limitation: an approval request that is not written to the local record may temporarily appear yellow. Exact coverage requires an official status stream that both clients can share.
