@@ -50,28 +50,21 @@ struct CodexTask: Identifiable, Equatable {
 enum StatusReader {
     struct RolloutSignals {
         var completed = false
-        var pendingQuestion = false
+        var pendingUserAction = false
     }
 
     private static let codexDirectory = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".codex", isDirectory: true)
     private static var signalCache: [String: (size: UInt64, signals: RolloutSignals)] = [:]
+    private static var cachedDatabase: OpaquePointer?
+    private static var cachedStateURL: URL?
 
     static func load(unreadIDs: Set<String> = []) throws -> [CodexTask] {
+        var succeeded = false
+        defer { if !succeeded { closeDatabase() } }
         let stateURL = try latestStateDatabase()
         let lockIDs = try writerLockIDs()
-        var database: OpaquePointer?
-
-        let flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_URI
-        let openResult = sqlite3_open_v2(stateURL.absoluteString + "?mode=ro", &database, flags, nil)
-        guard openResult == SQLITE_OK, let database else {
-            let error = failure(database, "无法打开 Codex 状态数据库")
-            if let database { sqlite3_close(database) }
-            throw error
-        }
-        defer { sqlite3_close(database) }
-        sqlite3_busy_timeout(database, 500)
-        sqlite3_exec(database, "PRAGMA query_only = ON", nil, nil, nil)
+        let database = try openDatabase(at: stateURL)
 
         let sql = """
         SELECT id,
@@ -127,7 +120,34 @@ enum StatusReader {
             if $0.isUnread != $1.isUnread { return $0.isUnread }
             return $0.updatedAt > $1.updatedAt
         }
-        return Array(tasks.prefix(8))
+        let visibleTasks = Array(tasks.prefix(8))
+        succeeded = true
+        return visibleTasks
+    }
+
+    fileprivate static func openDatabase(at stateURL: URL) throws -> OpaquePointer {
+        if cachedStateURL == stateURL, let cachedDatabase { return cachedDatabase }
+        closeDatabase()
+
+        var opened: OpaquePointer?
+        let flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_URI
+        let openResult = sqlite3_open_v2(stateURL.absoluteString + "?mode=ro", &opened, flags, nil)
+        guard openResult == SQLITE_OK, let opened else {
+            let error = failure(opened, "无法打开 Codex 状态数据库")
+            if let opened { sqlite3_close(opened) }
+            throw error
+        }
+        sqlite3_busy_timeout(opened, 500)
+        sqlite3_exec(opened, "PRAGMA query_only = ON", nil, nil, nil)
+        cachedDatabase = opened
+        cachedStateURL = stateURL
+        return opened
+    }
+
+    fileprivate static func closeDatabase() {
+        if let cachedDatabase { sqlite3_close(cachedDatabase) }
+        cachedDatabase = nil
+        cachedStateURL = nil
     }
 
     static func classify(
@@ -135,7 +155,7 @@ enum StatusReader {
         signals: RolloutSignals
     ) -> LightState {
         guard lockHeld, !signals.completed else { return .green }
-        return signals.pendingQuestion ? .red : .yellow
+        return signals.pendingUserAction ? .red : .yellow
     }
 
     static func signals(in data: Data) -> RolloutSignals {
@@ -163,13 +183,19 @@ enum StatusReader {
             guard recordType == "response_item",
                   let kind = payload["type"] as? String,
                   let callID = payload["call_id"] as? String else { continue }
-            if kind == "function_call", payload["name"] as? String == "request_user_input" {
-                pending.insert(callID)
-            } else if kind == "function_call_output" {
+            if kind == "function_call" || kind == "custom_tool_call" {
+                let name = payload["name"] as? String
+                let input = payload["input"] as? String ?? payload["arguments"] as? String ?? ""
+                if name == "request_user_input"
+                    || ((name == "exec" || name == "exec_command")
+                        && input.contains(#""sandbox_permissions":"require_escalated""#)) {
+                    pending.insert(callID)
+                }
+            } else if kind == "function_call_output" || kind == "custom_tool_call_output" {
                 pending.remove(callID)
             }
         }
-        result.pendingQuestion = !pending.isEmpty
+        result.pendingUserAction = !pending.isEmpty
         return result
     }
 
@@ -655,6 +681,7 @@ final class TaskMonitor: ObservableObject {
 
     private var timer: Timer?
     private var isLoading = false
+    private var consecutiveFailures = 0
     private var unreadCancellable: AnyCancellable?
     private let unreadStore: UnreadStore
 
@@ -686,6 +713,10 @@ final class TaskMonitor: ObservableObject {
         return tasks.map(\.state).max()
     }
 
+    fileprivate static func shouldPublishError(after failures: Int) -> Bool {
+        failures >= 2
+    }
+
     func refresh() {
         guard !isLoading else { return }
         isLoading = true
@@ -700,9 +731,12 @@ final class TaskMonitor: ObservableObject {
                 self.isLoading = false
                 switch result {
                 case .success(let tasks):
+                    self.consecutiveFailures = 0
                     if self.tasks != tasks { self.tasks = tasks }
                     if self.errorMessage != nil { self.errorMessage = nil }
                 case .failure(let error):
+                    self.consecutiveFailures += 1
+                    guard Self.shouldPublishError(after: self.consecutiveFailures) else { return }
                     let message = error.localizedDescription
                     if self.errorMessage != message { self.errorMessage = message }
                 }
@@ -1182,6 +1216,16 @@ private func runSelfTest() {
         {"type":"response_item","payload":{"type":"function_call","name":"request_user_input","call_id":"q1"}}
         {"type":"response_item","payload":{"type":"function_call_output","call_id":"q1"}}
         """.utf8)
+    let approval = Data(#"""
+        {"type":"response_item","payload":{"type":"custom_tool_call","status":"completed","name":"exec","call_id":"a1","input":"const r = await tools.exec_command({\"sandbox_permissions\":\"require_escalated\"});"}}
+        """#.utf8)
+    let approved = Data(#"""
+        {"type":"response_item","payload":{"type":"custom_tool_call","status":"completed","name":"exec","call_id":"a1","input":"const r = await tools.exec_command({\"sandbox_permissions\":\"require_escalated\"});"}}
+        {"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"a1"}}
+        """#.utf8)
+    let approvalMention = Data(#"""
+        {"type":"response_item","payload":{"type":"custom_tool_call","status":"completed","name":"exec","call_id":"a1","input":"const r = await tools.exec_command({\"cmd\":\"rg \\\"sandbox_permissions\\\":\\\"require_escalated\\\" file\"});"}}
+        """#.utf8)
 
     let running = Data("""
         {"type":"event_msg","payload":{"type":"task_started"}}
@@ -1191,9 +1235,13 @@ private func runSelfTest() {
         {"type":"event_msg","payload":{"type":"task_complete"}}
         """.utf8)
 
-    precondition(StatusReader.signals(in: prompt).pendingQuestion)
-    precondition(!StatusReader.signals(in: answered).pendingQuestion)
+    precondition(StatusReader.signals(in: prompt).pendingUserAction)
+    precondition(!StatusReader.signals(in: answered).pendingUserAction)
+    precondition(StatusReader.signals(in: approval).pendingUserAction)
+    precondition(!StatusReader.signals(in: approved).pendingUserAction)
+    precondition(!StatusReader.signals(in: approvalMention).pendingUserAction)
     precondition(StatusReader.classify(lockHeld: true, signals: StatusReader.signals(in: running)) == .yellow)
+    precondition(StatusReader.classify(lockHeld: true, signals: StatusReader.signals(in: approval)) == .red)
     precondition(StatusReader.classify(lockHeld: true, signals: StatusReader.signals(in: prompt)) == .red)
     precondition(StatusReader.classify(lockHeld: true, signals: StatusReader.signals(in: completed)) == .green)
     precondition(StatusReader.classify(lockHeld: false, signals: StatusReader.signals(in: running)) == .green)
@@ -1205,6 +1253,41 @@ private func runSelfTest() {
     precondition(TaskMonitor.aggregate(for: [green, yellow, red], errorMessage: nil) == .red)
     precondition(TaskMonitor.aggregate(for: [], errorMessage: nil) == nil)
     precondition(TaskMonitor.aggregate(for: [red], errorMessage: "failed") == nil)
+
+    precondition(!TaskMonitor.shouldPublishError(after: 1))
+    precondition(TaskMonitor.shouldPublishError(after: 2))
+
+    let sqliteTestDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("codex-traffic-light-\(UUID().uuidString)", isDirectory: true)
+    try! FileManager.default.createDirectory(at: sqliteTestDirectory, withIntermediateDirectories: false)
+    defer {
+        StatusReader.closeDatabase()
+        try? FileManager.default.removeItem(at: sqliteTestDirectory)
+    }
+    let sqliteTestURL = sqliteTestDirectory.appendingPathComponent("state.sqlite")
+    var writer: OpaquePointer?
+    precondition(sqlite3_open_v2(sqliteTestURL.path, &writer, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK)
+    precondition(sqlite3_exec(writer, "PRAGMA journal_mode=WAL; CREATE TABLE sample(value INTEGER); INSERT INTO sample VALUES(1)", nil, nil, nil) == SQLITE_OK)
+    func sampleValue(in database: OpaquePointer) -> Int32 {
+        var statement: OpaquePointer?
+        precondition(sqlite3_prepare_v2(database, "SELECT value FROM sample", -1, &statement, nil) == SQLITE_OK)
+        defer { sqlite3_finalize(statement) }
+        precondition(sqlite3_step(statement) == SQLITE_ROW)
+        return sqlite3_column_int(statement, 0)
+    }
+    let persistentReader = try! StatusReader.openDatabase(at: sqliteTestURL)
+    precondition(sampleValue(in: persistentReader) == 1)
+    sqlite3_close(writer)
+    precondition(FileManager.default.fileExists(atPath: sqliteTestURL.path + "-wal"))
+    precondition(try! StatusReader.openDatabase(at: sqliteTestURL) == persistentReader)
+    precondition(sampleValue(in: persistentReader) == 1)
+
+    let nextSQLiteTestURL = sqliteTestDirectory.appendingPathComponent("state_2.sqlite")
+    var nextWriter: OpaquePointer?
+    precondition(sqlite3_open_v2(nextSQLiteTestURL.path, &nextWriter, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK)
+    precondition(sqlite3_exec(nextWriter, "CREATE TABLE sample(value INTEGER); INSERT INTO sample VALUES(2)", nil, nil, nil) == SQLITE_OK)
+    precondition(sampleValue(in: try! StatusReader.openDatabase(at: nextSQLiteTestURL)) == 2)
+    sqlite3_close(nextWriter)
 
     let taskID = "01a0551f-9005-7ce2-b6f6-028df77a5997"
     precondition(TaskNavigator.codexThreadURL(taskID)?.absoluteString == "codex://threads/\(taskID)")

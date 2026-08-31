@@ -30,10 +30,10 @@ The first time you open a VS Code conversation, VS Code may ask whether the Code
 
 ## Data and Compatibility
 
-Every two seconds, the app reads the task index, task lifecycle, and writer locks under `~/.codex`. Access is read-only. Task titles come from Codex-generated names. The app checks the local record for the current turn only to determine whether a `request_user_input` call is still unanswered. When you click a task, it reads the session source and working directory to choose the correct destination. It does not display, store, or upload conversation content.
+Every two seconds, the app reads the task index, task lifecycle, and writer locks under `~/.codex`. Access is read-only. Task titles come from Codex-generated names. The app checks the local record for the current turn only to determine whether a `request_user_input` call or sandbox approval request is still awaiting its matching output. When you click a task, it reads the session source and working directory to choose the correct destination. It does not display, store, or upload conversation content.
 
 The app reads current unread thread IDs from Codex Desktop's `~/.codex/.codex-global-state.json` and VS Code's local state database. It also connects to the current user's `~/.codex/ipc/ipc.sock` and listens only for `thread-read-state-changed` events, because background completions update persisted unread state without broadcasting that event. IPC fallback state stays in the app's own UserDefaults; the app never writes to Codex or VS Code data.
 
 Codex Desktop and VS Code currently use separate private stdio App Server connections. External apps cannot subscribe directly to both live status streams, so this version uses their shared local state. The reader may need an update if Codex changes its local database or rollout format. See the official [Codex App Server documentation](https://developers.openai.com/codex/app-server).
 
-Known limitation: an approval request that is not written to the local record may temporarily appear yellow. Exact coverage requires an official status stream that both clients can share.
+Known limitation: the local record has no separate event for the instant an approval is granted, so the light may remain red until the approved command returns. An approval request that is not written to the local record may still appear yellow. Exact coverage requires an official status stream that both clients can share.
