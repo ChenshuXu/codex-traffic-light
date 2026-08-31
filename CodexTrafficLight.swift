@@ -17,11 +17,7 @@ enum LightState: Int, Comparable {
     }
 
     var color: Color {
-        switch self {
-        case .red: .red
-        case .yellow: .yellow
-        case .green: .green
-        }
+        Color(nsColor: nsColor)
     }
 
     var nsColor: NSColor {
@@ -50,18 +46,9 @@ struct CodexTask: Identifiable, Equatable {
     let updatedAt: Date
 }
 
-struct Snapshot {
-    let tasks: [CodexTask]
-}
-
 enum StatusReader {
-    enum Lifecycle {
-        case started
-        case completed
-    }
-
     struct RolloutSignals {
-        var lifecycle: Lifecycle?
+        var completed = false
         var pendingQuestion = false
     }
 
@@ -69,13 +56,13 @@ enum StatusReader {
         .appendingPathComponent(".codex", isDirectory: true)
     private static var signalCache: [String: (size: UInt64, signals: RolloutSignals)] = [:]
 
-    static func load() throws -> Snapshot {
-        let stateURL = try latestDatabase(prefix: "state")
+    static func load() throws -> [CodexTask] {
+        let stateURL = try latestStateDatabase()
         let lockIDs = try writerLockIDs()
         var database: OpaquePointer?
 
         let flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_URI
-        let openResult = sqlite3_open_v2(readOnlyURI(stateURL), &database, flags, nil)
+        let openResult = sqlite3_open_v2(stateURL.absoluteString + "?mode=ro", &database, flags, nil)
         guard openResult == SQLITE_OK, let database else {
             let error = failure(database, "无法打开 Codex 状态数据库")
             if let database { sqlite3_close(database) }
@@ -86,24 +73,19 @@ enum StatusReader {
         sqlite3_exec(database, "PRAGMA query_only = ON", nil, nil, nil)
 
         let sql = """
-        WITH recent AS (
-          SELECT id,
-                 COALESCE(NULLIF(name, ''), '未命名任务') AS display_title,
-                 COALESCE(cwd, '') AS cwd,
-                 rollout_path,
-                 CASE
-                   WHEN recency_at_ms > 0 THEN recency_at_ms
-                   WHEN updated_at_ms > 0 THEN updated_at_ms
-                   ELSE updated_at * 1000
-                 END AS recency_ms
-          FROM threads
-          WHERE archived = 0
-            AND (thread_source IS NULL OR thread_source = '' OR thread_source IN ('user', 'automation'))
-            AND source IN ('vscode', 'cli', 'exec', 'appServer')
-          ORDER BY recency_ms DESC
-        )
-        SELECT id, display_title, cwd, rollout_path, recency_ms
-        FROM recent
+        SELECT id,
+               COALESCE(NULLIF(name, ''), '未命名任务') AS display_title,
+               COALESCE(cwd, '') AS cwd,
+               rollout_path,
+               CASE
+                 WHEN recency_at_ms > 0 THEN recency_at_ms
+                 WHEN updated_at_ms > 0 THEN updated_at_ms
+                 ELSE updated_at * 1000
+               END AS recency_ms
+        FROM threads
+        WHERE archived = 0
+          AND (thread_source IS NULL OR thread_source = '' OR thread_source IN ('user', 'automation'))
+          AND source IN ('vscode', 'cli', 'exec', 'appServer')
         """
 
         var statement: OpaquePointer?
@@ -142,14 +124,14 @@ enum StatusReader {
             if $0.state != $1.state { return $0.state > $1.state }
             return $0.updatedAt > $1.updatedAt
         }
-        return Snapshot(tasks: Array(tasks.prefix(8)))
+        return Array(tasks.prefix(8))
     }
 
     static func classify(
         lockHeld: Bool,
         signals: RolloutSignals
     ) -> LightState {
-        guard lockHeld, signals.lifecycle != .completed else { return .green }
+        guard lockHeld, !signals.completed else { return .green }
         return signals.pendingQuestion ? .red : .yellow
     }
 
@@ -166,11 +148,11 @@ enum StatusReader {
             if recordType == "event_msg", let event = payload["type"] as? String {
                 if event == "task_started" {
                     pending.removeAll()
-                    result.lifecycle = .started
+                    result.completed = false
                 }
                 if event == "task_complete" {
                     pending.removeAll()
-                    result.lifecycle = .completed
+                    result.completed = true
                 }
                 continue
             }
@@ -250,29 +232,23 @@ enum StatusReader {
         }
     }
 
-    private static func latestDatabase(prefix: String) throws -> URL {
-        let pattern = try NSRegularExpression(pattern: "^\(NSRegularExpression.escapedPattern(for: prefix))_(\\d+)\\.sqlite$")
+    private static func latestStateDatabase() throws -> URL {
         let candidates = try FileManager.default.contentsOfDirectory(
             at: codexDirectory,
             includingPropertiesForKeys: nil
         ).compactMap { url -> (Int, URL)? in
-            let name = url.lastPathComponent
-            let range = NSRange(name.startIndex..., in: name)
-            guard let match = pattern.firstMatch(in: name, range: range),
-                  let versionRange = Range(match.range(at: 1), in: name),
-                  let version = Int(name[versionRange]) else {
+            let name = url.deletingPathExtension().lastPathComponent
+            guard url.pathExtension == "sqlite",
+                  name.hasPrefix("state_"),
+                  let version = Int(name.dropFirst(6)) else {
                 return nil
             }
             return (version, url)
         }
         guard let newest = candidates.max(by: { $0.0 < $1.0 }) else {
-            throw ReaderError("找不到 ~/.codex/\(prefix)_*.sqlite")
+            throw ReaderError("找不到 ~/.codex/state_*.sqlite")
         }
         return newest.1
-    }
-
-    private static func readOnlyURI(_ url: URL) -> String {
-        url.absoluteString + "?mode=ro"
     }
 
     private static func text(_ statement: OpaquePointer, _ column: Int32) -> String {
@@ -373,13 +349,11 @@ enum TaskNavigator {
 }
 
 struct ReaderError: LocalizedError {
-    let message: String
+    let errorDescription: String?
 
     init(_ message: String) {
-        self.message = message
+        errorDescription = message
     }
-
-    var errorDescription: String? { message }
 }
 
 final class TaskMonitor: ObservableObject {
@@ -420,8 +394,8 @@ final class TaskMonitor: ObservableObject {
                 guard let self else { return }
                 self.isLoading = false
                 switch result {
-                case .success(let snapshot):
-                    if self.tasks != snapshot.tasks { self.tasks = snapshot.tasks }
+                case .success(let tasks):
+                    if self.tasks != tasks { self.tasks = tasks }
                     if self.errorMessage != nil { self.errorMessage = nil }
                 case .failure(let error):
                     let message = error.localizedDescription
@@ -456,18 +430,6 @@ final class AppSettings: ObservableObject {
         showDesktopAtLaunch = defaults.object(forKey: Key.showDesktopAtLaunch) as? Bool ?? true
         alwaysOnTop = defaults.object(forKey: Key.alwaysOnTop) as? Bool ?? true
         showCompleted = defaults.object(forKey: Key.showCompleted) as? Bool ?? true
-    }
-}
-
-struct TrafficLightIcon: View {
-    let state: LightState?
-
-    var body: some View {
-        Circle()
-            .fill(state?.color ?? Color.secondary.opacity(0.55))
-            .frame(width: 11, height: 11)
-            .accessibilityElement(children: .ignore)
-            .accessibilityLabel("Codex，\(state?.label ?? "暂无状态")")
     }
 }
 
@@ -532,7 +494,11 @@ struct Dashboard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 11) {
             HStack(spacing: 9) {
-                TrafficLightIcon(state: monitor.aggregate)
+                Circle()
+                    .fill(monitor.aggregate?.color ?? Color.secondary.opacity(0.55))
+                    .frame(width: 11, height: 11)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("Codex，\(monitor.aggregate?.label ?? "暂无状态")")
                 VStack(alignment: .leading, spacing: 1) {
                     Text("Codex 状态")
                         .font(.system(size: 14, weight: .semibold))
@@ -890,7 +856,7 @@ private func runSelfTest() {
 
 private func printLiveSnapshot() -> Never {
     do {
-        let tasks = try StatusReader.load().tasks
+        let tasks = try StatusReader.load()
         let counts = Dictionary(grouping: tasks, by: \.state).mapValues(\.count)
         print("Live snapshot passed: \(tasks.count) tasks, red=\(counts[.red, default: 0]), yellow=\(counts[.yellow, default: 0]), green=\(counts[.green, default: 0])")
         exit(EXIT_SUCCESS)
