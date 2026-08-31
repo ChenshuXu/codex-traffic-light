@@ -41,6 +41,7 @@ struct CodexTask: Identifiable, Equatable {
     let id: String
     let title: String
     let state: LightState
+    let isUnread: Bool
     let cwd: String
     let rolloutPath: String
     let updatedAt: Date
@@ -56,7 +57,7 @@ enum StatusReader {
         .appendingPathComponent(".codex", isDirectory: true)
     private static var signalCache: [String: (size: UInt64, signals: RolloutSignals)] = [:]
 
-    static func load() throws -> [CodexTask] {
+    static func load(unreadIDs: Set<String> = []) throws -> [CodexTask] {
         let stateURL = try latestStateDatabase()
         let lockIDs = try writerLockIDs()
         var database: OpaquePointer?
@@ -110,6 +111,7 @@ enum StatusReader {
                 id: id,
                 title: title,
                 state: state,
+                isUnread: state == .green && unreadIDs.contains(id),
                 cwd: cwd,
                 rolloutPath: rolloutPath,
                 updatedAt: updatedAt
@@ -122,6 +124,7 @@ enum StatusReader {
 
         tasks.sort {
             if $0.state != $1.state { return $0.state > $1.state }
+            if $0.isUnread != $1.isUnread { return $0.isUnread }
             return $0.updatedAt > $1.updatedAt
         }
         return Array(tasks.prefix(8))
@@ -356,19 +359,296 @@ struct ReaderError: LocalizedError {
     }
 }
 
+enum VSCodeUnreadReader {
+    static func load() -> Set<String>? {
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Code/User/globalStorage/state.vscdb")
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+
+        var database: OpaquePointer?
+        let flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_URI
+        guard sqlite3_open_v2(url.absoluteString + "?mode=ro", &database, flags, nil) == SQLITE_OK,
+              let database else {
+            if let database { sqlite3_close(database) }
+            return nil
+        }
+        defer { sqlite3_close(database) }
+        sqlite3_busy_timeout(database, 500)
+        sqlite3_exec(database, "PRAGMA query_only = ON", nil, nil, nil)
+
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(
+            database,
+            "SELECT value FROM ItemTable WHERE key = 'openai.chatgpt'",
+            -1,
+            &statement,
+            nil
+        ) == SQLITE_OK, let statement else { return nil }
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW,
+              let bytes = sqlite3_column_text(statement, 0) else { return nil }
+        return ids(in: Data(bytes: bytes, count: Int(sqlite3_column_bytes(statement, 0))))
+    }
+
+    static func ids(in data: Data) -> Set<String> {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let persisted = root["persisted-atom-state"] as? [String: Any],
+              let unreadByHost = persisted["unread-thread-ids-by-host-v1"] as? [String: Any],
+              let local = unreadByHost["local"] as? [String] else { return [] }
+        return Set(local.filter { UUID(uuidString: $0) != nil })
+    }
+}
+
+final class UnreadStore: ObservableObject {
+    private static let key = "unreadThreadIDs"
+
+    @Published private(set) var ids: Set<String>
+    private let defaults: UserDefaults
+
+    init(defaults: UserDefaults = .standard, bootstrap: () -> Set<String>? = VSCodeUnreadReader.load) {
+        self.defaults = defaults
+        if let saved = defaults.array(forKey: Self.key) as? [String] {
+            ids = Set(saved.filter { UUID(uuidString: $0) != nil })
+        } else {
+            ids = bootstrap() ?? []
+            persist()
+        }
+    }
+
+    func set(_ threadID: String, unread: Bool) {
+        guard UUID(uuidString: threadID) != nil else { return }
+        var updated = ids
+        let changed = unread ? updated.insert(threadID).inserted : updated.remove(threadID) != nil
+        guard changed else { return }
+        ids = updated
+        persist()
+    }
+
+    private func persist() {
+        defaults.set(ids.sorted(), forKey: Self.key)
+    }
+}
+
+enum CodexIPCProtocol {
+    static let maxFrameBytes = 45 * 1_024 * 1_024
+
+    static func frame(_ object: [String: Any]) throws -> Data {
+        let payload = try JSONSerialization.data(withJSONObject: object)
+        guard payload.count <= maxFrameBytes else { throw ReaderError("Codex IPC 消息过大") }
+        let length = UInt32(payload.count)
+        var data = Data([
+            UInt8(length & 0xff),
+            UInt8((length >> 8) & 0xff),
+            UInt8((length >> 16) & 0xff),
+            UInt8((length >> 24) & 0xff)
+        ])
+        data.append(payload)
+        return data
+    }
+
+    static func nextObject(from buffer: inout Data) throws -> [String: Any]? {
+        guard buffer.count >= 4 else { return nil }
+        let length = Int(buffer[buffer.startIndex])
+            | Int(buffer[buffer.startIndex + 1]) << 8
+            | Int(buffer[buffer.startIndex + 2]) << 16
+            | Int(buffer[buffer.startIndex + 3]) << 24
+        guard length > 0, length <= maxFrameBytes else { throw ReaderError("Codex IPC 帧无效") }
+        guard buffer.count >= length + 4 else { return nil }
+        let payload = buffer.subdata(in: 4..<(length + 4))
+        buffer.removeSubrange(0..<(length + 4))
+        guard let object = try JSONSerialization.jsonObject(with: payload) as? [String: Any] else {
+            throw ReaderError("Codex IPC JSON 无效")
+        }
+        return object
+    }
+
+    static func unreadChange(in object: [String: Any]) -> (threadID: String, unread: Bool)? {
+        guard object["type"] as? String == "broadcast",
+              object["method"] as? String == "thread-read-state-changed",
+              (object["version"] as? NSNumber)?.intValue == 2,
+              let params = object["params"] as? [String: Any],
+              params["hostId"] as? String == "local",
+              let threadID = params["conversationId"] as? String,
+              UUID(uuidString: threadID) != nil,
+              let unread = params["hasUnreadTurn"] as? Bool else { return nil }
+        return (threadID, unread)
+    }
+}
+
+final class CodexIPCUnreadListener {
+    private let queue = DispatchQueue(label: "com.newton.codex-traffic-light.ipc")
+    private let socketURL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".codex/ipc/ipc.sock")
+    private let onChange: (String, Bool) -> Void
+    private var buffer = Data()
+    private var source: DispatchSourceRead?
+    private var reconnectWorkItem: DispatchWorkItem?
+    private var stopped = false
+
+    init(onChange: @escaping (String, Bool) -> Void) {
+        self.onChange = onChange
+    }
+
+    func start() {
+        queue.async { [weak self] in
+            guard let self, !self.stopped, self.source == nil else { return }
+            self.connect()
+        }
+    }
+
+    func stop() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.stopped = true
+            self.reconnectWorkItem?.cancel()
+            self.source?.cancel()
+            self.source = nil
+        }
+    }
+
+    private func connect() {
+        guard !stopped, Self.isTrustedSocket(socketURL.path) else {
+            scheduleReconnect()
+            return
+        }
+
+        let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        guard descriptor >= 0 else {
+            scheduleReconnect()
+            return
+        }
+        var noSigPipe: Int32 = 1
+        setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout.size(ofValue: noSigPipe)))
+
+        var address = sockaddr_un()
+        address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+        address.sun_family = sa_family_t(AF_UNIX)
+        let pathBytes = socketURL.path.utf8CString.map { UInt8(bitPattern: $0) }
+        guard pathBytes.count <= MemoryLayout.size(ofValue: address.sun_path) else {
+            Darwin.close(descriptor)
+            return
+        }
+        withUnsafeMutableBytes(of: &address.sun_path) { $0.copyBytes(from: pathBytes) }
+        let result = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard result == 0 else {
+            Darwin.close(descriptor)
+            scheduleReconnect()
+            return
+        }
+
+        reconnectWorkItem?.cancel()
+        buffer.removeAll(keepingCapacity: true)
+        let readSource = DispatchSource.makeReadSource(fileDescriptor: descriptor, queue: queue)
+        readSource.setEventHandler { [weak self] in self?.read(from: descriptor) }
+        readSource.setCancelHandler { Darwin.close(descriptor) }
+        source = readSource
+        readSource.resume()
+
+        send([
+            "type": "request",
+            "requestId": UUID().uuidString,
+            "sourceClientId": "initializing-client",
+            "version": 0,
+            "method": "initialize",
+            "params": ["clientType": "traffic-light"]
+        ], to: descriptor)
+    }
+
+    private func read(from descriptor: Int32) {
+        var bytes = [UInt8](repeating: 0, count: 65_536)
+        let count = Darwin.read(descriptor, &bytes, bytes.count)
+        guard count > 0 else {
+            if count < 0, errno == EINTR { return }
+            disconnect()
+            return
+        }
+        buffer.append(contentsOf: bytes.prefix(count))
+
+        do {
+            while let object = try CodexIPCProtocol.nextObject(from: &buffer) {
+                if let change = CodexIPCProtocol.unreadChange(in: object) {
+                    onChange(change.threadID, change.unread)
+                } else if object["type"] as? String == "client-discovery-request",
+                          let requestID = object["requestId"] as? String {
+                    send([
+                        "type": "client-discovery-response",
+                        "requestId": requestID,
+                        "response": ["canHandle": false]
+                    ], to: descriptor)
+                }
+            }
+        } catch {
+            disconnect()
+        }
+    }
+
+    private func send(_ object: [String: Any], to descriptor: Int32) {
+        guard let frame = try? CodexIPCProtocol.frame(object) else { return }
+        let written = frame.withUnsafeBytes { rawBuffer -> Bool in
+            guard let baseAddress = rawBuffer.baseAddress else { return false }
+            var offset = 0
+            while offset < rawBuffer.count {
+                let count = Darwin.write(descriptor, baseAddress.advanced(by: offset), rawBuffer.count - offset)
+                if count > 0 {
+                    offset += count
+                } else if count < 0, errno == EINTR {
+                    continue
+                } else {
+                    return false
+                }
+            }
+            return true
+        }
+        if !written { disconnect() }
+    }
+
+    private func disconnect() {
+        source?.cancel()
+        source = nil
+        buffer.removeAll(keepingCapacity: true)
+        scheduleReconnect()
+    }
+
+    private func scheduleReconnect() {
+        guard !stopped, reconnectWorkItem == nil || reconnectWorkItem?.isCancelled == true else { return }
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.reconnectWorkItem = nil
+            self.connect()
+        }
+        reconnectWorkItem = item
+        queue.asyncAfter(deadline: .now() + 1, execute: item)
+    }
+
+    private static func isTrustedSocket(_ path: String) -> Bool {
+        var status = stat()
+        guard lstat(path, &status) == 0 else { return false }
+        return status.st_uid == getuid()
+            && status.st_mode & mode_t(S_IFMT) == mode_t(S_IFSOCK)
+    }
+}
+
 final class TaskMonitor: ObservableObject {
     @Published private(set) var tasks: [CodexTask] = []
     @Published private(set) var errorMessage: String?
 
     private var timer: Timer?
     private var isLoading = false
+    private var unreadCancellable: AnyCancellable?
+    private let unreadStore: UnreadStore
 
-    init() {
+    init(unreadStore: UnreadStore) {
+        self.unreadStore = unreadStore
         let timer = Timer(timeInterval: 2, repeats: true) { [weak self] _ in
             self?.refresh()
         }
         self.timer = timer
         RunLoop.main.add(timer, forMode: .common)
+        unreadCancellable = unreadStore.$ids.dropFirst().sink { [weak self] _ in self?.refresh() }
         refresh()
     }
 
@@ -380,6 +660,10 @@ final class TaskMonitor: ObservableObject {
         Self.aggregate(for: tasks, errorMessage: errorMessage)
     }
 
+    var unreadCount: Int {
+        tasks.count { $0.isUnread }
+    }
+
     static func aggregate(for tasks: [CodexTask], errorMessage: String?) -> LightState? {
         guard errorMessage == nil else { return nil }
         return tasks.map(\.state).max()
@@ -388,8 +672,9 @@ final class TaskMonitor: ObservableObject {
     func refresh() {
         guard !isLoading else { return }
         isLoading = true
+        let unreadIDs = unreadStore.ids
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let result = Result { try StatusReader.load() }
+            let result = Result { try StatusReader.load(unreadIDs: unreadIDs) }
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.isLoading = false
@@ -453,6 +738,10 @@ struct TaskRow: View {
     let task: CodexTask
     let openTask: () -> Void
 
+    private var statusLabel: String {
+        task.isUnread ? "\(task.state.label)，未读" : task.state.label
+    }
+
     var body: some View {
         Button(action: openTask) {
             HStack(spacing: 9) {
@@ -460,13 +749,13 @@ struct TaskRow: View {
                     .fill(task.state.color)
                     .frame(width: 8, height: 8)
                 Text(task.title)
-                    .font(.system(size: 12.5, weight: .medium))
+                    .font(.system(size: 12.5, weight: task.isUnread ? .semibold : .medium))
                     .lineLimit(1)
                     .truncationMode(.tail)
                 Spacer(minLength: 6)
-                Text(task.state.label)
+                Text(task.isUnread ? "未读" : task.state.label)
                     .font(.system(size: 10.5))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(task.isUnread ? Color.blue : Color.secondary)
             }
             .padding(.horizontal, 10)
             .frame(height: 34)
@@ -475,7 +764,7 @@ struct TaskRow: View {
         }
         .buttonStyle(.plain)
         .help("打开“\(task.title)”")
-        .accessibilityLabel("打开 \(task.title)，\(task.state.label)")
+        .accessibilityLabel("打开 \(task.title)，\(statusLabel)")
     }
 }
 
@@ -488,7 +777,7 @@ struct Dashboard: View {
     let showSettings: () -> Void
 
     private var visibleTasks: [CodexTask] {
-        settings.showCompleted ? monitor.tasks : monitor.tasks.filter { $0.state != .green }
+        settings.showCompleted ? monitor.tasks : monitor.tasks.filter { $0.state != .green || $0.isUnread }
     }
 
     var body: some View {
@@ -588,6 +877,12 @@ struct Dashboard: View {
             count(.red)
             count(.yellow)
             count(.green)
+            HStack(spacing: 3) {
+                Circle().fill(Color.blue).frame(width: 6, height: 6)
+                Text("\(monitor.unreadCount)")
+                    .font(.system(size: 10, design: .rounded))
+                    .foregroundStyle(.secondary)
+            }
         }
         .accessibilityElement(children: .combine)
     }
@@ -624,7 +919,9 @@ struct SettingsView: View {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let monitor = TaskMonitor()
+    private let unreadStore: UnreadStore
+    private let monitor: TaskMonitor
+    private let unreadListener: CodexIPCUnreadListener
     private let settings = AppSettings()
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     private let popover = NSPopover()
@@ -634,7 +931,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var panelHost: NSHostingController<Dashboard>?
     private var cancellables = Set<AnyCancellable>()
 
+    override init() {
+        let unreadStore = UnreadStore()
+        self.unreadStore = unreadStore
+        monitor = TaskMonitor(unreadStore: unreadStore)
+        unreadListener = CodexIPCUnreadListener { threadID, unread in
+            DispatchQueue.main.async { unreadStore.set(threadID, unread: unread) }
+        }
+        super.init()
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        unreadListener.start()
         configureStatusItem()
         configurePopover()
         configurePanel()
@@ -658,6 +966,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if settings.showDesktopAtLaunch {
             DispatchQueue.main.async { [weak self] in self?.showDesktop(activate: false) }
         }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        unreadListener.stop()
     }
 
     private func configureStatusItem() {
@@ -745,7 +1057,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let button = statusItem.button else { return }
         let state = TaskMonitor.aggregate(for: tasks, errorMessage: errorMessage)
         button.image = MenuBarDot.image(for: state)
-        let detail = errorMessage == nil ? (state?.label ?? "没有任务") : "状态读取失败"
+        let unreadCount = tasks.count { $0.isUnread }
+        let stateDetail = state?.label ?? "没有任务"
+        let detail = errorMessage == nil
+            ? (unreadCount > 0 ? "\(stateDetail)，\(unreadCount) 条未读" : stateDetail)
+            : "状态读取失败"
         button.setAccessibilityLabel("Codex，\(detail)")
         button.toolTip = "Codex：\(detail)"
     }
@@ -823,9 +1139,9 @@ private func runSelfTest() {
     precondition(StatusReader.classify(lockHeld: false, signals: StatusReader.signals(in: running)) == .green)
 
     let now = Date()
-    let green = CodexTask(id: "g", title: "green", state: .green, cwd: "/tmp", rolloutPath: "/tmp/g", updatedAt: now)
-    let yellow = CodexTask(id: "y", title: "yellow", state: .yellow, cwd: "/tmp", rolloutPath: "/tmp/y", updatedAt: now)
-    let red = CodexTask(id: "r", title: "red", state: .red, cwd: "/tmp", rolloutPath: "/tmp/r", updatedAt: now)
+    let green = CodexTask(id: "g", title: "green", state: .green, isUnread: false, cwd: "/tmp", rolloutPath: "/tmp/g", updatedAt: now)
+    let yellow = CodexTask(id: "y", title: "yellow", state: .yellow, isUnread: false, cwd: "/tmp", rolloutPath: "/tmp/y", updatedAt: now)
+    let red = CodexTask(id: "r", title: "red", state: .red, isUnread: false, cwd: "/tmp", rolloutPath: "/tmp/r", updatedAt: now)
     precondition(TaskMonitor.aggregate(for: [green, yellow, red], errorMessage: nil) == .red)
     precondition(TaskMonitor.aggregate(for: [], errorMessage: nil) == nil)
     precondition(TaskMonitor.aggregate(for: [red], errorMessage: "failed") == nil)
@@ -837,6 +1153,24 @@ private func runSelfTest() {
     precondition(TaskNavigator.vscodeWorkspaceURL("/Users/Newton/Project With Space")?.absoluteString == "file:///Users/Newton/Project%20With%20Space/")
     precondition(TaskNavigator.isVSCode(sessionHeader: Data(#"{"type":"session_meta","payload":{"originator":"codex_vscode"}}"#.utf8)))
     precondition(!TaskNavigator.isVSCode(sessionHeader: Data(#"{"type":"session_meta","payload":{"originator":"codex_work_desktop"}}"#.utf8)))
+
+    let unreadID = "01a0551f-9005-7ce2-b6f6-028df77a5997"
+    let unreadJSON = Data(#"{"persisted-atom-state":{"unread-thread-ids-by-host-v1":{"local":["01a0551f-9005-7ce2-b6f6-028df77a5997","bad"]}}}"#.utf8)
+    precondition(VSCodeUnreadReader.ids(in: unreadJSON) == [unreadID])
+    let broadcast: [String: Any] = [
+        "type": "broadcast",
+        "method": "thread-read-state-changed",
+        "version": 2,
+        "params": ["hostId": "local", "conversationId": unreadID, "hasUnreadTurn": false]
+    ]
+    var partialFrame = try! CodexIPCProtocol.frame(broadcast)
+    let tail = partialFrame.subdata(in: 3..<partialFrame.count)
+    partialFrame.removeSubrange(3..<partialFrame.count)
+    precondition(try! CodexIPCProtocol.nextObject(from: &partialFrame) == nil)
+    partialFrame.append(tail)
+    let decoded = try! CodexIPCProtocol.nextObject(from: &partialFrame)
+    let change = decoded.flatMap(CodexIPCProtocol.unreadChange)
+    precondition(change?.threadID == unreadID && change?.unread == false && partialFrame.isEmpty)
 
     let menuImage = MenuBarDot.image(for: .yellow)
     precondition(menuImage.size == NSSize(width: 18, height: 14))
@@ -851,14 +1185,19 @@ private func runSelfTest() {
     initial.showCompleted = false
     let restored = AppSettings(defaults: defaults)
     precondition(!restored.alwaysOnTop && !restored.showCompleted)
+    let unreadStore = UnreadStore(defaults: defaults) { [unreadID] }
+    precondition(unreadStore.ids == [unreadID])
+    unreadStore.set(unreadID, unread: false)
+    precondition(UnreadStore(defaults: defaults) { [] }.ids.isEmpty)
     print("Codex Traffic Light self-test passed")
 }
 
 private func printLiveSnapshot() -> Never {
     do {
-        let tasks = try StatusReader.load()
+        let unreadIDs = VSCodeUnreadReader.load() ?? []
+        let tasks = try StatusReader.load(unreadIDs: unreadIDs)
         let counts = Dictionary(grouping: tasks, by: \.state).mapValues(\.count)
-        print("Live snapshot passed: \(tasks.count) tasks, red=\(counts[.red, default: 0]), yellow=\(counts[.yellow, default: 0]), green=\(counts[.green, default: 0])")
+        print("Live snapshot passed: \(tasks.count) tasks, red=\(counts[.red, default: 0]), yellow=\(counts[.yellow, default: 0]), green=\(counts[.green, default: 0]), unread=\(tasks.count { $0.isUnread })")
         exit(EXIT_SUCCESS)
     } catch {
         fputs("Live snapshot failed: \(error.localizedDescription)\n", stderr)
