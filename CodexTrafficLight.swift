@@ -45,6 +45,8 @@ struct CodexTask: Identifiable, Equatable {
     let id: String
     let title: String
     let state: LightState
+    let cwd: String
+    let rolloutPath: String
     let updatedAt: Date
 }
 
@@ -87,6 +89,7 @@ enum StatusReader {
         WITH recent AS (
           SELECT id,
                  COALESCE(NULLIF(name, ''), '未命名任务') AS display_title,
+                 COALESCE(cwd, '') AS cwd,
                  rollout_path,
                  CASE
                    WHEN recency_at_ms > 0 THEN recency_at_ms
@@ -99,7 +102,7 @@ enum StatusReader {
             AND source IN ('vscode', 'cli', 'exec', 'appServer')
           ORDER BY recency_ms DESC
         )
-        SELECT id, display_title, rollout_path, recency_ms
+        SELECT id, display_title, cwd, rollout_path, recency_ms
         FROM recent
         """
 
@@ -115,12 +118,20 @@ enum StatusReader {
         while stepResult == SQLITE_ROW {
             let id = text(statement, 0)
             let title = cleanTitle(text(statement, 1))
-            let rolloutPath = text(statement, 2)
-            let updatedAt = Date(timeIntervalSince1970: Double(sqlite3_column_int64(statement, 3)) / 1_000)
+            let cwd = text(statement, 2)
+            let rolloutPath = text(statement, 3)
+            let updatedAt = Date(timeIntervalSince1970: Double(sqlite3_column_int64(statement, 4)) / 1_000)
             let lockHeld = lockIDs.contains(id) ? try hasLiveWriter(threadID: id) : false
             let signals = lockHeld ? readSignals(rolloutPath: rolloutPath) : RolloutSignals()
             let state = classify(lockHeld: lockHeld, signals: signals)
-            tasks.append(CodexTask(id: id, title: title, state: state, updatedAt: updatedAt))
+            tasks.append(CodexTask(
+                id: id,
+                title: title,
+                state: state,
+                cwd: cwd,
+                rolloutPath: rolloutPath,
+                updatedAt: updatedAt
+            ))
             stepResult = sqlite3_step(statement)
         }
         guard stepResult == SQLITE_DONE else {
@@ -281,6 +292,86 @@ enum StatusReader {
     }
 }
 
+enum TaskNavigator {
+    static func open(_ task: CodexTask) {
+        guard isVSCode(rolloutPath: task.rolloutPath) else {
+            if let url = codexThreadURL(task.id) { NSWorkspace.shared.open(url) }
+            return
+        }
+
+        let openThread = {
+            if let url = vscodeThreadURL(task.id) { NSWorkspace.shared.open(url) }
+        }
+        guard let workspaceURL = vscodeWorkspaceURL(task.cwd),
+              let applicationURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.microsoft.VSCode") else {
+            openThread()
+            return
+        }
+
+        // ponytail: VS Code has no atomic workspace + task URL. Focus the workspace
+        // first, then use the extension route; keep this fallback until one exists.
+        let process = Process()
+        process.executableURL = applicationURL
+            .appendingPathComponent("Contents/Resources/app/bin/code")
+        process.arguments = ["--folder-uri", workspaceURL.absoluteString]
+        do {
+            try process.run()
+        } catch {
+            openThread()
+            return
+        }
+        DispatchQueue.global(qos: .utility).async {
+            process.waitUntilExit()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: openThread)
+        }
+    }
+
+    static func codexThreadURL(_ id: String) -> URL? {
+        guard UUID(uuidString: id) != nil else { return nil }
+        return URL(string: "codex://threads/\(id)")
+    }
+
+    static func vscodeThreadURL(_ id: String) -> URL? {
+        guard UUID(uuidString: id) != nil else { return nil }
+        var components = URLComponents()
+        components.scheme = "vscode"
+        components.host = "openai.chatgpt"
+        components.path = "/local/\(id)"
+        return components.url
+    }
+
+    static func vscodeWorkspaceURL(_ cwd: String) -> URL? {
+        guard cwd.hasPrefix("/") else { return nil }
+        return URL(fileURLWithPath: cwd, isDirectory: true).standardizedFileURL
+    }
+
+    static func isVSCode(sessionHeader data: Data) -> Bool {
+        guard let line = data.split(separator: 0x0A, maxSplits: 1).first,
+              let object = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
+              let payload = object["payload"] as? [String: Any],
+              let originator = payload["originator"] as? String else {
+            return false
+        }
+        return originator.lowercased().contains("vscode")
+    }
+
+    private static func isVSCode(rolloutPath: String) -> Bool {
+        let codexDirectory = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex", isDirectory: true)
+            .standardizedFileURL
+        let url = URL(fileURLWithPath: rolloutPath).standardizedFileURL
+        guard url.path.hasPrefix(codexDirectory.path + "/"),
+              let handle = try? FileHandle(forReadingFrom: url) else {
+            return false
+        }
+        defer { try? handle.close() }
+        // ponytail: session_meta is currently about 20 KiB; switch to chunked
+        // newline reading if Codex grows the first record beyond 64 KiB.
+        guard let data = try? handle.read(upToCount: 65_536) else { return false }
+        return isVSCode(sessionHeader: data)
+    }
+}
+
 struct ReaderError: LocalizedError {
     let message: String
 
@@ -398,25 +489,31 @@ enum MenuBarDot {
 
 struct TaskRow: View {
     let task: CodexTask
+    let openTask: () -> Void
 
     var body: some View {
-        HStack(spacing: 9) {
-            Circle()
-                .fill(task.state.color)
-                .frame(width: 8, height: 8)
-            Text(task.title)
-                .font(.system(size: 12.5, weight: .medium))
-                .lineLimit(1)
-                .truncationMode(.tail)
-            Spacer(minLength: 6)
-            Text(task.state.label)
-                .font(.system(size: 10.5))
-                .foregroundStyle(.secondary)
+        Button(action: openTask) {
+            HStack(spacing: 9) {
+                Circle()
+                    .fill(task.state.color)
+                    .frame(width: 8, height: 8)
+                Text(task.title)
+                    .font(.system(size: 12.5, weight: .medium))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 6)
+                Text(task.state.label)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 34)
+            .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 9))
+            .contentShape(Rectangle())
         }
-        .padding(.horizontal, 10)
-        .frame(height: 34)
-        .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 9))
-        .accessibilityElement(children: .combine)
+        .buttonStyle(.plain)
+        .help("打开“\(task.title)”")
+        .accessibilityLabel("打开 \(task.title)，\(task.state.label)")
     }
 }
 
@@ -424,6 +521,7 @@ struct Dashboard: View {
     @ObservedObject var monitor: TaskMonitor
     @ObservedObject var settings: AppSettings
     let isDesktop: Bool
+    let openTask: (CodexTask) -> Void
     let showDesktop: () -> Void
     let showSettings: () -> Void
 
@@ -459,7 +557,9 @@ struct Dashboard: View {
             } else {
                 VStack(spacing: 5) {
                     ForEach(visibleTasks) { task in
-                        TaskRow(task: task)
+                        TaskRow(task: task) {
+                            openTask(task)
+                        }
                     }
                 }
             }
@@ -606,6 +706,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             monitor: monitor,
             settings: settings,
             isDesktop: false,
+            openTask: { [weak self] task in
+                self?.popover.performClose(nil)
+                TaskNavigator.open(task)
+            },
             showDesktop: { [weak self] in
                 self?.popover.performClose(nil)
                 self?.showDesktop(activate: true)
@@ -623,6 +727,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             monitor: monitor,
             settings: settings,
             isDesktop: true,
+            openTask: { TaskNavigator.open($0) },
             showDesktop: {},
             showSettings: { [weak self] in self?.showSettings() }
         )
@@ -752,12 +857,20 @@ private func runSelfTest() {
     precondition(StatusReader.classify(lockHeld: false, signals: StatusReader.signals(in: running)) == .green)
 
     let now = Date()
-    let green = CodexTask(id: "g", title: "green", state: .green, updatedAt: now)
-    let yellow = CodexTask(id: "y", title: "yellow", state: .yellow, updatedAt: now)
-    let red = CodexTask(id: "r", title: "red", state: .red, updatedAt: now)
+    let green = CodexTask(id: "g", title: "green", state: .green, cwd: "/tmp", rolloutPath: "/tmp/g", updatedAt: now)
+    let yellow = CodexTask(id: "y", title: "yellow", state: .yellow, cwd: "/tmp", rolloutPath: "/tmp/y", updatedAt: now)
+    let red = CodexTask(id: "r", title: "red", state: .red, cwd: "/tmp", rolloutPath: "/tmp/r", updatedAt: now)
     precondition(TaskMonitor.aggregate(for: [green, yellow, red], errorMessage: nil) == .red)
     precondition(TaskMonitor.aggregate(for: [], errorMessage: nil) == nil)
     precondition(TaskMonitor.aggregate(for: [red], errorMessage: "failed") == nil)
+
+    let taskID = "01a0551f-9005-7ce2-b6f6-028df77a5997"
+    precondition(TaskNavigator.codexThreadURL(taskID)?.absoluteString == "codex://threads/\(taskID)")
+    precondition(TaskNavigator.codexThreadURL("bad") == nil)
+    precondition(TaskNavigator.vscodeThreadURL(taskID)?.absoluteString == "vscode://openai.chatgpt/local/\(taskID)")
+    precondition(TaskNavigator.vscodeWorkspaceURL("/Users/Newton/Project With Space")?.absoluteString == "file:///Users/Newton/Project%20With%20Space/")
+    precondition(TaskNavigator.isVSCode(sessionHeader: Data(#"{"type":"session_meta","payload":{"originator":"codex_vscode"}}"#.utf8)))
+    precondition(!TaskNavigator.isVSCode(sessionHeader: Data(#"{"type":"session_meta","payload":{"originator":"codex_work_desktop"}}"#.utf8)))
 
     let menuImage = MenuBarDot.image(for: .yellow)
     precondition(menuImage.size == NSSize(width: 18, height: 14))
