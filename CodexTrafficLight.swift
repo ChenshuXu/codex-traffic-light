@@ -399,6 +399,23 @@ enum VSCodeUnreadReader {
     }
 }
 
+enum CodexDesktopUnreadReader {
+    static func load() -> Set<String>? {
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex/.codex-global-state.json")
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return ids(in: data)
+    }
+
+    static func ids(in data: Data) -> Set<String> {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let persisted = root["electron-persisted-atom-state"] as? [String: Any],
+              let unreadByHost = persisted["unread-thread-ids-by-host-v1"] as? [String: Any],
+              let local = unreadByHost["local"] as? [String] else { return [] }
+        return Set(local.filter { UUID(uuidString: $0) != nil })
+    }
+}
+
 final class UnreadStore: ObservableObject {
     private static let key = "unreadThreadIDs"
 
@@ -672,8 +689,11 @@ final class TaskMonitor: ObservableObject {
     func refresh() {
         guard !isLoading else { return }
         isLoading = true
-        let unreadIDs = unreadStore.ids
+        let storedUnreadIDs = unreadStore.ids
         DispatchQueue.global(qos: .utility).async { [weak self] in
+            let detectedUnreadIDs = (CodexDesktopUnreadReader.load() ?? [])
+                .union(VSCodeUnreadReader.load() ?? [])
+            let unreadIDs = storedUnreadIDs.union(detectedUnreadIDs)
             let result = Result { try StatusReader.load(unreadIDs: unreadIDs) }
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -732,6 +752,15 @@ enum MenuBarDot {
         image.isTemplate = false
         return image
     }
+}
+
+private func windowFrame(fromAutosaveValue value: String) -> NSRect? {
+    let fields = value.split(whereSeparator: \.isWhitespace)
+    guard fields.count >= 4,
+          let x = Double(fields[0]), let y = Double(fields[1]),
+          let width = Double(fields[2]), let height = Double(fields[3]),
+          x.isFinite, y.isFinite, width > 0, height > 0 else { return nil }
+    return NSRect(x: x, y: y, width: width, height: height)
 }
 
 struct TaskRow: View {
@@ -918,7 +947,10 @@ struct SettingsView: View {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+    private static let panelFrameKey = "CodexTrafficLightDesktopWindowFrame"
+    private static let legacyPanelFrameKey = "NSWindow Frame CodexTrafficLightDesktopWindow"
+
     private let unreadStore: UnreadStore
     private let monitor: TaskMonitor
     private let unreadListener: CodexIPCUnreadListener
@@ -1010,6 +1042,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             showSettings: { [weak self] in self?.showSettings() }
         )
         let host = NSHostingController(rootView: root)
+        host.sizingOptions = [.intrinsicContentSize]
         panelHost = host
 
         let panel = NSPanel(
@@ -1026,13 +1059,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.standardWindowButton(.miniaturizeButton)?.isHidden = true
         panel.standardWindowButton(.zoomButton)?.isHidden = true
 
-        let frameName = "CodexTrafficLightDesktopWindow"
-        if !panel.setFrameUsingName(frameName), let screen = NSScreen.main {
+        var restoredFrame = false
+        let savedFrame = UserDefaults.standard.string(forKey: Self.panelFrameKey)
+            ?? UserDefaults.standard.string(forKey: Self.legacyPanelFrameKey)
+        if let value = savedFrame,
+           let frame = windowFrame(fromAutosaveValue: value),
+           NSScreen.screens.contains(where: { $0.frame.intersects(frame) }) {
+            panel.setFrame(frame, display: false)
+            restoredFrame = true
+        }
+        if !restoredFrame, let screen = NSScreen.main {
             let visible = screen.visibleFrame
             panel.setFrameOrigin(NSPoint(x: visible.maxX - panel.frame.width - 18, y: visible.maxY - panel.frame.height - 18))
         }
-        panel.setFrameAutosaveName(frameName)
         self.panel = panel
+        panel.delegate = self
         applyPanelLevel()
     }
 
@@ -1075,8 +1116,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             guard let panel = self.panel, let host = self.panelHost else { return }
             host.view.layoutSubtreeIfNeeded()
+            let contentSize = host.view.fittingSize
+            guard panel.contentView?.bounds.size != contentSize else { return }
             let oldTop = panel.frame.maxY
-            panel.setContentSize(host.view.fittingSize)
+            panel.setContentSize(contentSize)
             panel.setFrameOrigin(NSPoint(x: panel.frame.minX, y: oldTop - panel.frame.height))
         }
     }
@@ -1084,6 +1127,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func applyPanelLevel() {
         panel?.isFloatingPanel = settings.alwaysOnTop
         panel?.level = settings.alwaysOnTop ? .floating : .normal
+    }
+
+    func windowDidMove(_ notification: Notification) {
+        savePanelFrame(notification)
+    }
+
+    func windowDidResize(_ notification: Notification) {
+        savePanelFrame(notification)
+    }
+
+    private func savePanelFrame(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow, window === panel else { return }
+        let frame = window.frame
+        UserDefaults.standard.set(
+            "\(frame.minX) \(frame.minY) \(frame.width) \(frame.height)",
+            forKey: Self.panelFrameKey
+        )
     }
 
     @objc private func togglePopover() {
@@ -1153,10 +1213,14 @@ private func runSelfTest() {
     precondition(TaskNavigator.vscodeWorkspaceURL("/Users/Newton/Project With Space")?.absoluteString == "file:///Users/Newton/Project%20With%20Space/")
     precondition(TaskNavigator.isVSCode(sessionHeader: Data(#"{"type":"session_meta","payload":{"originator":"codex_vscode"}}"#.utf8)))
     precondition(!TaskNavigator.isVSCode(sessionHeader: Data(#"{"type":"session_meta","payload":{"originator":"codex_work_desktop"}}"#.utf8)))
+    precondition(windowFrame(fromAutosaveValue: "-514 1088 320 440 -1440 -324 1440 2530") == NSRect(x: -514, y: 1088, width: 320, height: 440))
+    precondition(windowFrame(fromAutosaveValue: "broken") == nil)
 
     let unreadID = "01a0551f-9005-7ce2-b6f6-028df77a5997"
     let unreadJSON = Data(#"{"persisted-atom-state":{"unread-thread-ids-by-host-v1":{"local":["01a0551f-9005-7ce2-b6f6-028df77a5997","bad"]}}}"#.utf8)
     precondition(VSCodeUnreadReader.ids(in: unreadJSON) == [unreadID])
+    let desktopUnreadJSON = Data(#"{"electron-persisted-atom-state":{"unread-thread-ids-by-host-v1":{"local":["01a0551f-9005-7ce2-b6f6-028df77a5997","bad"]}}}"#.utf8)
+    precondition(CodexDesktopUnreadReader.ids(in: desktopUnreadJSON) == [unreadID])
     let broadcast: [String: Any] = [
         "type": "broadcast",
         "method": "thread-read-state-changed",
@@ -1194,7 +1258,8 @@ private func runSelfTest() {
 
 private func printLiveSnapshot() -> Never {
     do {
-        let unreadIDs = VSCodeUnreadReader.load() ?? []
+        let unreadIDs = (CodexDesktopUnreadReader.load() ?? [])
+            .union(VSCodeUnreadReader.load() ?? [])
         let tasks = try StatusReader.load(unreadIDs: unreadIDs)
         let counts = Dictionary(grouping: tasks, by: \.state).mapValues(\.count)
         print("Live snapshot passed: \(tasks.count) tasks, red=\(counts[.red, default: 0]), yellow=\(counts[.yellow, default: 0]), green=\(counts[.green, default: 0]), unread=\(tasks.count { $0.isUnread })")
