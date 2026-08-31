@@ -575,8 +575,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         configureSettingsWindow()
 
         monitor.$tasks.combineLatest(monitor.$errorMessage)
-            .sink { [weak self] _, _ in
-                self?.updateStatusItem()
+            .sink { [weak self] tasks, errorMessage in
+                // @Published emits before its stored value changes, so use the emitted snapshot here.
+                self?.updateStatusItem(tasks: tasks, errorMessage: errorMessage)
                 self?.resizeDashboards()
             }
             .store(in: &cancellables)
@@ -587,7 +588,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .sink { [weak self] _ in self?.applyPanelLevel() }
             .store(in: &cancellables)
 
-        updateStatusItem()
+        updateStatusItem(tasks: monitor.tasks, errorMessage: monitor.errorMessage)
         if settings.showDesktopAtLaunch {
             DispatchQueue.main.async { [weak self] in self?.showDesktop(activate: false) }
         }
@@ -669,10 +670,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         settingsWindow = window
     }
 
-    private func updateStatusItem() {
+    private func updateStatusItem(tasks: [CodexTask], errorMessage: String?) {
         guard let button = statusItem.button else { return }
-        button.image = MenuBarDot.image(for: monitor.aggregate)
-        let detail = monitor.errorMessage == nil ? (monitor.aggregate?.label ?? "没有任务") : "状态读取失败"
+        let state = TaskMonitor.aggregate(for: tasks, errorMessage: errorMessage)
+        button.image = MenuBarDot.image(for: state)
+        let detail = errorMessage == nil ? (state?.label ?? "没有任务") : "状态读取失败"
         button.setAccessibilityLabel("Codex，\(detail)")
         button.toolTip = "Codex：\(detail)"
     }
