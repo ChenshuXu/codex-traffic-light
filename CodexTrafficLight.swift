@@ -351,6 +351,46 @@ struct TrafficLightIcon: View {
     }
 }
 
+struct MenuBarTrafficLightIcon: View {
+    let state: LightState
+
+    var body: some View {
+        Image(nsImage: Self.image(for: state))
+            .renderingMode(.original)
+            .frame(width: 18, height: 12)
+            .accessibilityLabel("Codex，\(state.label)")
+    }
+
+    static func image(for state: LightState) -> NSImage {
+        let size = NSSize(width: 18, height: 12)
+        let image = NSImage(size: size, flipped: false) { _ in
+            let states: [LightState] = [.red, .yellow, .green]
+            let diameter: CGFloat = 4.5
+            let gap: CGFloat = 1.5
+            let startX = (size.width - diameter * 3 - gap * 2) / 2
+            let y = (size.height - diameter) / 2
+
+            for (index, dotState) in states.enumerated() {
+                let color: NSColor = switch dotState {
+                case .red: .systemRed
+                case .yellow: .systemYellow
+                case .green: .systemGreen
+                }
+                color.withAlphaComponent(dotState == state ? 1 : 0.32).setFill()
+                NSBezierPath(ovalIn: NSRect(
+                    x: startX + CGFloat(index) * (diameter + gap),
+                    y: y,
+                    width: diameter,
+                    height: diameter
+                )).fill()
+            }
+            return true
+        }
+        image.isTemplate = false
+        return image
+    }
+}
+
 struct TaskRow: View {
     let task: CodexTask
 
@@ -481,7 +521,7 @@ struct CodexTrafficLightApp: App {
         MenuBarExtra {
             Dashboard(monitor: monitor)
         } label: {
-            TrafficLightIcon(state: monitor.aggregate)
+            MenuBarTrafficLightIcon(state: monitor.aggregate)
         }
         .menuBarExtraStyle(.window)
     }
@@ -509,6 +549,9 @@ struct CodexTrafficLightApp: App {
         precondition(StatusReader.classify(lockHeld: true, signals: StatusReader.signals(in: prompt)) == .red)
         precondition(StatusReader.classify(lockHeld: true, signals: StatusReader.signals(in: completed)) == .green)
         precondition(StatusReader.classify(lockHeld: false, signals: StatusReader.signals(in: running)) == .green)
+        let menuImage = MenuBarTrafficLightIcon.image(for: .yellow)
+        precondition(menuImage.size == NSSize(width: 18, height: 12))
+        precondition((menuImage.tiffRepresentation?.count ?? 0) > 100)
         print("Codex Traffic Light self-test passed")
     }
 }
